@@ -68,9 +68,6 @@ fun Application.module() {
         println("MinIO init error: ${e.message}")
     }
 
-    // create MinioService instance for presign endpoints
-    val minioService = MinioService(minioClient, minioBucket)
-
     routing {
         get("/health") { call.respond(mapOf("status" to "ok")) }
 
@@ -221,9 +218,6 @@ fun Application.module() {
                 } else call.respond(mapOf("error" to "invalid conversation id"))
             }
         }
-
-        // register minio presign routes
-        minioRoutes(minioService)
 
         // serve uploaded files (local) and provide simple route for minio proxy (demo only)
         static("/uploads") {
