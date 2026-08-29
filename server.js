@@ -6,9 +6,11 @@ const cors = require('cors');
 require('dotenv').config();
 
 const admin = require('firebase-admin');
+const jwt = require('jsonwebtoken');
 
 const Message = require('./models/Message');
 const DeviceToken = require('./models/DeviceToken');
+const User = require('./models/User');
 
 const app = express();
 app.use(cors());
@@ -18,6 +20,8 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" }
 });
+
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
 
 // تهيئة firebase-admin
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
@@ -43,11 +47,59 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/twasol_chat
   useUnifiedTopology: true
 }).then(() => console.log('تم الاتصال بقاعدة البيانات بنجاح')).catch(err => console.log(err));
 
-// مسار لتسجيل device token
-app.post('/register-token', async (req, res) => {
+// مساعدة: توليد JWT
+function signToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+}
+
+// مساعدة: تحقق من JWT
+function verifyToken(token) {
   try {
-    const { userId, token } = req.body;
-    if (!userId || !token) return res.status(400).json({ error: 'userId و token مطلوبان' });
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return { valid: true, payload: decoded };
+  } catch (e) {
+    return { valid: false, error: e };
+  }
+}
+
+// مسارات المصادقة المبسطة (تذكي��: في الإنتاج استعمل كلمات مرور أو OAuth)
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId مطلوب' });
+
+    // إنشاء المستخدم إن لم يكن موجودًا (بدون كلمة مرور هنا للاختبار)
+    let user = await User.findOne({ userId });
+    if (!user) {
+      user = new User({ userId });
+      await user.save();
+    }
+
+    const token = signToken({ userId: user.userId });
+    res.json({ token });
+  } catch (err) {
+    console.error('auth/login error', err);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// Middleware لحماية مسارات HTTP
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+  const token = auth.split(' ')[1];
+  const { valid, payload } = verifyToken(token);
+  if (!valid) return res.status(401).json({ error: 'Invalid token' });
+  req.user = payload;
+  next();
+}
+
+// مسار لتسجيل device token محفوظ ومحمي
+app.post('/register-token', authMiddleware, async (req, res) => {
+  try {
+    const { token } = req.body;
+    const userId = req.user.userId;
+    if (!userId || !token) return res.status(400).json({ error: 'token مطلوب' });
 
     await DeviceToken.findOneAndUpdate(
       { userId },
@@ -62,7 +114,7 @@ app.post('/register-token', async (req, res) => {
   }
 });
 
-app.get('/messages', async (req, res) => {
+app.get('/messages', authMiddleware, async (req, res) => {
   try {
     const { user1, user2, limit = 50, skip = 0 } = req.query;
     if (!user1 || !user2) return res.status(400).json({ error: 'user1 و user2 مطلوبان' });
@@ -84,7 +136,7 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-app.post('/messages/mark-read', async (req, res) => {
+app.post('/messages/mark-read', authMiddleware, async (req, res) => {
   try {
     const { userId, otherId } = req.body;
     if (!userId || !otherId) return res.status(400).json({ error: 'userId و otherId مطلوبان' });
@@ -100,14 +152,42 @@ app.post('/messages/mark-read', async (req, res) => {
   }
 });
 
+// Socket.IO authentication: دعم كلتا الطريقتين (query token لـ v2 و auth.token لـ v3+)
+io.use((socket, next) => {
+  const queryToken = socket.handshake.query && socket.handshake.query.token;
+  const authToken = socket.handshake.auth && socket.handshake.auth.token;
+  const token = queryToken || authToken;
+  if (!token) return next(new Error('Authentication error: token required'));
+  const { valid, payload, error } = verifyToken(token);
+  if (!valid) return next(new Error('Authentication error: invalid token'));
+  // attach userId to socket for later use
+  socket.userId = payload.userId;
+  next();
+});
+
 io.on('connection', (socket) => {
-  console.log(`مستخدم متصل: ${socket.id}`);
+  console.log(`مستخدم متصل: ${socket.id} (userId=${socket.userId})`);
+
+  // شبك تلقائي: عند الاتصال نضع في onlineUsers
+  try {
+    if (socket.userId) {
+      onlineUsers.set(socket.userId, socket.id);
+      socket.join(socket.userId);
+    }
+  } catch (err) {
+    console.error('join_room on connect error', err);
+  }
 
   socket.on('join_room', (userId) => {
     try {
-      onlineUsers.set(userId, socket.id);
-      socket.join(userId);
-      console.log(`المستخدم ${userId} انضم للغرفة`);
+      // فقط اسمح للمستخدم بالانضمام إلى غرفته الخاصة
+      if (userId === socket.userId) {
+        onlineUsers.set(userId, socket.id);
+        socket.join(userId);
+        console.log(`المستخدم ${userId} انضم للغرفة`);
+      } else {
+        console.log(`محاولة انضمام غير مصرح بها: ${userId} (socket user: ${socket.userId})`);
+      }
     } catch (err) {
       console.error('join_room error', err);
     }
@@ -115,6 +195,12 @@ io.on('connection', (socket) => {
 
   socket.on('send_message', async (data) => {
     try {
+      // التحقق أن المرسل هو صاحب الـ socket
+      if (data.senderId !== socket.userId) {
+        console.warn(`محاولة إرسال باسم مختلف: payload.sender=${data.senderId} socket.user=${socket.userId}`);
+        return socket.emit('error', { error: 'Unauthorized senderId' });
+      }
+
       const newMessage = new Message({
         senderId: data.senderId,
         receiverId: data.receiverId,
