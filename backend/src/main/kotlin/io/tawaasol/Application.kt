@@ -32,6 +32,7 @@ import io.minio.MinioClient
 import io.minio.PutObjectArgs
 import java.util.UUID
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 fun main() {
     embeddedServer(Netty, port = 8080, module = Application::module).start(wait = true)
@@ -54,6 +55,10 @@ fun Application.module() {
     val redisPort = (System.getenv("REDIS_PORT") ?: "6379").toInt()
     val jedis = Jedis(redisHost, redisPort)
 
+    // Typing throttle map: track last typing event per (conversationId, userId)
+    val typingLastSent = ConcurrentHashMap<Pair<Int, Int>, Long>()
+    val TYPING_THROTTLE_MS = 500L
+
     // MinIO client init (optional)
     val minioEndpoint = System.getenv("MINIO_ENDPOINT") ?: System.getenv("MINIO_HOST") ?: "http://localhost:9000"
     val minioAccess = System.getenv("MINIO_ROOT_USER") ?: System.getenv("MINIO_ACCESS_KEY") ?: "minioadmin"
@@ -68,7 +73,7 @@ fun Application.module() {
         println("MinIO init error: ${e.message}")
     }
 
-    // create MinioService instance for presign endpoints
+    // create MinioService instance for presign endpoints (if present)
     val minioService = MinioService(minioClient, minioBucket)
 
     routing {
@@ -266,34 +271,56 @@ fun Application.module() {
                         val text = frame.readText()
                         val map = Json.parseToJsonElement(text).jsonObject
                         val type = map["type"]?.jsonPrimitive?.content
-                        if (type == "join") {
-                            val convId = map["conversationId"]?.jsonPrimitive?.int ?: continue
-                            if (!joined.contains(convId)) {
-                                // subscribe
-                                try {
-                                    jedisSub.subscribe(object : redis.clients.jedis.JedisPubSub() {}, "conversation:$convId")
-                                } catch (e: Exception) { println("subscribe error: ${e.message}") }
-                                joined.add(convId)
-                                // notify client joined
-                                val evt = Json.encodeToString(mapOf("type" to "joined", "conversationId" to convId))
-                                outgoing.trySend(Frame.Text(evt))
+                        when (type) {
+                            "join" -> {
+                                val convId = map["conversationId"]?.jsonPrimitive?.int ?: continue
+                                if (!joined.contains(convId)) {
+                                    try {
+                                        jedisSub.subscribe(object : redis.clients.jedis.JedisPubSub() {}, "conversation:$convId")
+                                    } catch (e: Exception) { println("subscribe error: ${e.message}") }
+                                    joined.add(convId)
+                                    // notify client joined
+                                    val evt = Json.encodeToString(mapOf("type" to "joined", "conversationId" to convId))
+                                    outgoing.trySend(Frame.Text(evt))
+                                }
                             }
-                        } else if (type == "leave") {
-                            val convId = map["conversationId"]?.jsonPrimitive?.int ?: continue
-                            if (joined.remove(convId)) {
-                                // JedisPubSub unsubscribe not trivial with our anonymous subscriber; for demo we just track and rely on connection close
-                                val evt = Json.encodeToString(mapOf("type" to "left", "conversationId" to convId))
-                                outgoing.trySend(Frame.Text(evt))
+                            "leave" -> {
+                                val convId = map["conversationId"]?.jsonPrimitive?.int ?: continue
+                                if (joined.remove(convId)) {
+                                    val evt = Json.encodeToString(mapOf("type" to "left", "conversationId" to convId))
+                                    outgoing.trySend(Frame.Text(evt))
+                                }
                             }
-                        } else if (type == "message") {
-                            val convId = map["conversationId"]?.jsonPrimitive?.int ?: continue
-                            val content = map["content"]?.jsonPrimitive?.content ?: continue
-                            val mid = DatabaseFactory.createMessage(convId, userId, content)
-                            val msgJson = Json.encodeToString(mapOf("type" to "message", "conversationId" to convId, "id" to mid, "senderId" to userId, "content" to content))
-                            jedis.publish("conversation:$convId", msgJson)
-                            // send ack back to sender
-                            val ack = Json.encodeToString(mapOf("type" to "ack", "messageId" to mid))
-                            outgoing.trySend(Frame.Text(ack))
+                            "message" -> {
+                                val convId = map["conversationId"]?.jsonPrimitive?.int ?: continue
+                                val content = map["content"]?.jsonPrimitive?.content ?: continue
+                                val mid = DatabaseFactory.createMessage(convId, userId, content)
+                                val msgJson = Json.encodeToString(mapOf("type" to "message", "conversationId" to convId, "id" to mid, "senderId" to userId, "content" to content))
+                                jedis.publish("conversation:$convId", msgJson)
+                                // send ack back to sender
+                                val ack = Json.encodeToString(mapOf("type" to "ack", "messageId" to mid))
+                                outgoing.trySend(Frame.Text(ack))
+                            }
+                            "typing" -> {
+                                val convId = map["conversationId"]?.jsonPrimitive?.int ?: continue
+                                val state = map["state"]?.jsonPrimitive?.content ?: continue
+
+                                // validate participant
+                                if (!DatabaseFactory.validateParticipant(convId, userId)) continue
+
+                                val key = Pair(convId, userId)
+                                val now = System.currentTimeMillis()
+                                val last = typingLastSent[key] ?: 0L
+                                if (state == "start") {
+                                    if (now - last < TYPING_THROTTLE_MS) continue
+                                    typingLastSent[key] = now
+                                } else {
+                                    typingLastSent.remove(key)
+                                }
+
+                                val typingEvent = Json.encodeToString(mapOf("type" to "typing", "conversationId" to convId, "userId" to userId, "state" to state))
+                                jedis.publish("conversation:$convId", typingEvent)
+                            }
                         }
                     }
                 }
@@ -309,18 +336,3 @@ fun Application.module() {
         }
     }
 }
-
-@Serializable
-data class RequestOtpRequest(val phone: String)
-
-@Serializable
-data class VerifyOtpRequest(val phone: String, val otp: String, val name: String? = null)
-
-@Serializable
-data class CreateConversationRequest(val title: String)
-
-@Serializable
-data class SendMessageRequest(val senderId: Int, val content: String)
-
-@Serializable
-data class MessageDto(val id: Int, val conversationId: Int, val senderId: Int, val content: String, val timestamp: String)
