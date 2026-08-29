@@ -1,0 +1,2 @@
+rootProject.name = "tawaasol-mobile"
+include ":app"
