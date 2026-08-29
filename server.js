@@ -7,10 +7,12 @@ require('dotenv').config();
 
 const admin = require('firebase-admin');
 const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
 
 const Message = require('./models/Message');
 const DeviceToken = require('./models/DeviceToken');
 const User = require('./models/User');
+const RefreshToken = require('./models/RefreshToken');
 
 const app = express();
 app.use(cors());
@@ -21,7 +23,10 @@ const io = new Server(server, {
   cors: { origin: "*" }
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
+const JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET || (process.env.JWT_SECRET || 'change_this_secret');
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'change_this_refresh_secret';
+const ACCESS_EXPIRES = process.env.ACCESS_EXPIRES || '15m'; // access token expiry
+const REFRESH_EXPIRES_DAYS = parseInt(process.env.REFRESH_EXPIRES_DAYS || '30', 10);
 
 // تهيئة firebase-admin
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
@@ -47,22 +52,40 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/twasol_chat
   useUnifiedTopology: true
 }).then(() => console.log('تم الاتصال بقاعدة البيانات بنجاح')).catch(err => console.log(err));
 
-// مساعدة: توليد JWT
-function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+// توليد Access token
+function signAccessToken(payload) {
+  return jwt.sign(payload, JWT_ACCESS_SECRET, { expiresIn: ACCESS_EXPIRES });
 }
 
-// مساعدة: تحقق من JWT
-function verifyToken(token) {
+// توليد Refresh token مع jti مخزن
+function signRefreshToken(userId) {
+  const tokenId = uuidv4();
+  const expiresAt = new Date(Date.now() + REFRESH_EXPIRES_DAYS * 24 * 60 * 60 * 1000);
+  const token = jwt.sign({ tokenId, userId }, JWT_REFRESH_SECRET, { expiresIn: `${REFRESH_EXPIRES_DAYS}d` });
+  return { token, tokenId, expiresAt };
+}
+
+// مساعدة: تحقق من JWT access
+function verifyAccessToken(token) {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_ACCESS_SECRET);
     return { valid: true, payload: decoded };
   } catch (e) {
     return { valid: false, error: e };
   }
 }
 
-// مسارات المصادقة المبسطة (تذكي��: في الإنتاج استعمل كلمات مرور أو OAuth)
+// مساعدة: تحقق من refresh token
+function verifyRefreshToken(token) {
+  try {
+    const decoded = jwt.verify(token, JWT_REFRESH_SECRET);
+    return { valid: true, payload: decoded };
+  } catch (e) {
+    return { valid: false, error: e };
+  }
+}
+
+// مسارات المصادقة
 app.post('/auth/login', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -75,20 +98,72 @@ app.post('/auth/login', async (req, res) => {
       await user.save();
     }
 
-    const token = signToken({ userId: user.userId });
-    res.json({ token });
+    const accessToken = signAccessToken({ userId: user.userId });
+    const { token: refreshToken, tokenId, expiresAt } = signRefreshToken(user.userId);
+
+    // خزّن refresh token في DB
+    await RefreshToken.create({ tokenId, userId: user.userId, expiresAt });
+
+    res.json({ accessToken, refreshToken });
   } catch (err) {
     console.error('auth/login error', err);
     res.status(500).json({ error: 'server error' });
   }
 });
 
-// Middleware لحماية مسارات HTTP
+// endpoint لتدوير refresh token واصدار access جديد
+app.post('/auth/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ error: 'refreshToken مطلوب' });
+
+    const { valid, payload, error } = verifyRefreshToken(refreshToken);
+    if (!valid) return res.status(401).json({ error: 'Invalid refresh token' });
+
+    const { tokenId, userId } = payload;
+    // تحقق من وجوده في DB ولم يُلغَ
+    const stored = await RefreshToken.findOne({ tokenId, userId });
+    if (!stored || stored.revoked) return res.status(401).json({ error: 'Refresh token revoked or not found' });
+    if (stored.expiresAt < new Date()) return res.status(401).json({ error: 'Refresh token expired' });
+
+    // دوران: الغي التوكن القديم وأنشئ واحدًا جديدًا
+    stored.revoked = true;
+    await stored.save();
+
+    const accessToken = signAccessToken({ userId });
+    const { token: newRefreshToken, tokenId: newTokenId, expiresAt } = signRefreshToken(userId);
+    await RefreshToken.create({ tokenId: newTokenId, userId, expiresAt });
+
+    res.json({ accessToken, refreshToken: newRefreshToken });
+  } catch (err) {
+    console.error('auth/refresh error', err);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// logout: إبطال refresh token المحدد
+app.post('/auth/logout', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ error: 'refreshToken مطلوب' });
+    const { valid, payload } = verifyRefreshToken(refreshToken);
+    if (!valid) return res.status(200).json({ ok: true }); // idempotent
+
+    const { tokenId, userId } = payload;
+    await RefreshToken.updateOne({ tokenId, userId }, { $set: { revoked: true } });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('auth/logout error', err);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// Middleware لحماية مسارات HTTP باستخدام access token
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
   const token = auth.split(' ')[1];
-  const { valid, payload } = verifyToken(token);
+  const { valid, payload } = verifyAccessToken(token);
   if (!valid) return res.status(401).json({ error: 'Invalid token' });
   req.user = payload;
   next();
@@ -158,7 +233,7 @@ io.use((socket, next) => {
   const authToken = socket.handshake.auth && socket.handshake.auth.token;
   const token = queryToken || authToken;
   if (!token) return next(new Error('Authentication error: token required'));
-  const { valid, payload, error } = verifyToken(token);
+  const { valid, payload, error } = verifyAccessToken(token);
   if (!valid) return next(new Error('Authentication error: invalid token'));
   // attach userId to socket for later use
   socket.userId = payload.userId;
@@ -168,7 +243,6 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
   console.log(`مستخدم متصل: ${socket.id} (userId=${socket.userId})`);
 
-  // شبك تلقائي: عند الاتصال نضع في onlineUsers
   try {
     if (socket.userId) {
       onlineUsers.set(socket.userId, socket.id);
@@ -180,7 +254,6 @@ io.on('connection', (socket) => {
 
   socket.on('join_room', (userId) => {
     try {
-      // فقط اسمح للمستخدم بالانضمام إلى غرفته الخاصة
       if (userId === socket.userId) {
         onlineUsers.set(userId, socket.id);
         socket.join(userId);
@@ -195,7 +268,6 @@ io.on('connection', (socket) => {
 
   socket.on('send_message', async (data) => {
     try {
-      // التحقق أن المرسل هو صاحب الـ socket
       if (data.senderId !== socket.userId) {
         console.warn(`محاولة إرسال باسم مختلف: payload.sender=${data.senderId} socket.user=${socket.userId}`);
         return socket.emit('error', { error: 'Unauthorized senderId' });
@@ -213,7 +285,6 @@ io.on('connection', (socket) => {
       if (receiverSocketId) {
         io.to(receiverSocketId).emit('receive_message', saved);
       } else {
-        // إذا المستلم غير متّصل: حاول إرسال FCM
         try {
           const device = await DeviceToken.findOne({ userId: data.receiverId });
           if (device && device.token && admin.apps.length > 0) {
@@ -238,7 +309,6 @@ io.on('connection', (socket) => {
               })
               .catch(err => {
                 console.error('FCM error:', err);
-                // إذا فشل بسبب token غير صالح، يمكن حذف token هنا
               });
           } else {
             console.log(`لا يوجد device token صالح للمستخدم ${data.receiverId} أو firebase غير مهيأ.`);
@@ -269,5 +339,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`خادم Twasol Chat يعمل بكفاءة على المنفذ ${PORT}`);
+  console.log(`خادم Twasol Chat يع��ل بكفاءة على المنفذ ${PORT}`);
 });

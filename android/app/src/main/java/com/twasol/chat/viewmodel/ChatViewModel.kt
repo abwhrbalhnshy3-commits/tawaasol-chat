@@ -27,7 +27,8 @@ class ChatViewModel : ViewModel() {
 
     private var currentUserId: String = ""
     private var recipientId: String = ""
-    private var jwtToken: String? = null
+    private var accessToken: String? = null
+    private var refreshToken: String? = null
 
     // استدعِ login ثم connect
     fun loginAndConnect(userId: String, otherId: String, onResult: (Boolean, String?) -> Unit) {
@@ -51,17 +52,59 @@ class ChatViewModel : ViewModel() {
                     }
                     val respBody = resp.body?.string() ?: ""
                     val obj = JSONObject(respBody)
-                    jwtToken = obj.optString("token", null)
-                    if (jwtToken == null) {
-                        onResult(false, "no token returned")
+                    accessToken = obj.optString("accessToken", null)
+                    refreshToken = obj.optString("refreshToken", null)
+                    if (accessToken == null || refreshToken == null) {
+                        onResult(false, "tokens not returned")
                         return@use
                     }
 
                     // بعد الحصول على التوكن: سجل token جهاز FCM عند الحاجة
-                    registerTokenToServer(userId, jwtToken!!)
+                    registerTokenToServer(userId, accessToken!!)
 
                     // ثم اتصل بالـ socket مع تمرير التوكن كـ query (متوافق مع socket.io-client v2)
-                    connectToServerWithToken(jwtToken!!)
+                    connectToServerWithToken(accessToken!!)
+
+                    onResult(true, null)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                onResult(false, e.message)
+            }
+        }.start()
+    }
+
+    // طلب تدوير التوكنات باستخدام refreshToken
+    fun refreshTokens(onResult: (Boolean, String?) -> Unit) {
+        val rToken = refreshToken ?: run { onResult(false, "no refresh token"); return }
+        val client = OkHttpClient()
+        val json = JSONObject().apply { put("refreshToken", rToken) }
+        val body = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url("http://10.0.2.2:3000/auth/refresh")
+            .post(body)
+            .build()
+
+        Thread {
+            try {
+                client.newCall(request).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        onResult(false, "refresh failed: ${resp.code}")
+                        return@use
+                    }
+                    val respBody = resp.body?.string() ?: ""
+                    val obj = JSONObject(respBody)
+                    accessToken = obj.optString("accessToken", null)
+                    refreshToken = obj.optString("refreshToken", null)
+                    if (accessToken == null) {
+                        onResult(false, "no access token returned")
+                        return@use
+                    }
+
+                    // إعادة الاتصال بالـ socket مع التوكن الجديد
+                    socket?.disconnect()
+                    socket = null
+                    connectToServerWithToken(accessToken!!)
 
                     onResult(true, null)
                 }
@@ -75,7 +118,6 @@ class ChatViewModel : ViewModel() {
     private fun connectToServerWithToken(token: String) {
         try {
             val opts = IO.Options()
-            // socket.io-client v2 uses query string; نمرر token كـ query
             opts.query = "token=$token"
             socket = IO.socket("http://10.0.2.2:3000", opts)
             socket?.connect()
@@ -112,7 +154,6 @@ class ChatViewModel : ViewModel() {
                 socket?.emit("join_room", currentUserId)
             }
 
-            // انضم للغرفة باسم المستخدم بعد الاتصال
             socket?.on(Socket.EVENT_CONNECT) {
                 socket?.emit("join_room", currentUserId)
             }
@@ -163,9 +204,9 @@ class ChatViewModel : ViewModel() {
         }
     }
 
-    fun registerTokenToServer(userId: String, token: String) {
-        // تأكد من أن jwtToken موجودة
-        val jwt = jwtToken ?: return
+    fun registerTokenToServer(userId: String, accessJwt: String) {
+        // تأكد من أن accessToken موجودة
+        val jwt = accessJwt
         FirebaseTokenRegistrar.registerToken(userId, jwt)
     }
 
