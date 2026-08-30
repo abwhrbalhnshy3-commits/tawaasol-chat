@@ -7,12 +7,14 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./android
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -20,9 +22,16 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Generate Gradle Wrapper and Build APK
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prebuild Android project
+        run: npx expo prebuild --platform android --non-interactive
+
+      - name: Build APK with Gradle
         run: |
-          gradle wrapper
+          cd android
+          chmod +x gradlew
           ./gradlew assembleDebug
 
       - name: Upload APK artifact
