@@ -33,17 +33,22 @@ jobs:
       - name: Generate Android Native Folder
         run: |
           if [ -f "package.json" ]; then
-            npx expo prebuild --platform android --non-interactive || npx react-native-asset || true
+            npx expo prebuild --platform android --non-interactive || true
           elif [ -f "mobile/package.json" ]; then
             cd mobile && npx expo prebuild --platform android --non-interactive || true
           fi
 
-      - name: Build APK with Gradle
+      - name: Build APK with Gradle Direct
         run: |
           if [ -d "android" ]; then
             cd android
           elif [ -d "mobile/android" ]; then
             cd mobile/android
+          fi
+          # توليد ملفات Gradle ميكانيكياً إذا لم تكن موجودة
+          npx @react-native-community/cli-platform-android || true
+          if [ ! -f "gradlew" ]; then
+            gradle wrapper
           fi
           chmod +x gradlew
           ./gradlew assembleDebug
