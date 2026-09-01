@@ -1,0 +1,35 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=tawaasol
+      - MONGO_INITDB_ROOT_PASSWORD=tawaasol_dev_pw
+      - MONGO_INITDB_DATABASE=twasol_chat
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    image: node:22
+    working_dir: /app
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+      - node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./.env.base44-defaults
+    command: sh -c "npm install && npx nodemon --legacy-watch server.js"
+
+volumes:
+  mongo_data:
+  node_modules:

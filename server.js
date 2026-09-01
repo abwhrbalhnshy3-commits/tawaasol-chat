@@ -47,6 +47,18 @@ if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
 
 const onlineUsers = new Map();
 
+// Health / info route for the web preview
+app.get('/', (req, res) => {
+  res.json({
+    service: 'Tawaasol Chat API',
+    status: 'ok',
+    online: onlineUsers.size,
+    endpoints: ['/auth/login', '/auth/refresh', '/auth/logout', '/register-token', '/messages', '/messages/mark-read']
+  });
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
 mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/twasol_chat', {
   useNewUrlParser: true,
   useUnifiedTopology: true
